@@ -466,30 +466,53 @@ async def run_live_agent(
         # 确保队列被消费
         pass
 
+    # If the feeder task aborted via HookAbortError (or any other
+    # BaseException not caught by the feeder's `except Exception`), surface
+    # it now so the pipeline scheduler's HookAbortError catch can suppress
+    # downstream stages and skip the trailing tts_stats send. Without this,
+    # the feeder's exception is left unretrieved and the live stream
+    # finishes "normally", violating the fail_closed contract.
+    feeder_exc: BaseException | None = None
+    if feeder_task.done() and not feeder_task.cancelled():
+        try:
+            feeder_exc = feeder_task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            feeder_exc = None
+
     tts_end_time = time.time()
 
-    # 发送 TTS 统计信息
-    try:
-        astr_event = agent_runner.run_context.context.event
-        if astr_event.get_platform_name() == "webchat":
-            tts_duration = tts_end_time - tts_start_time
-            await astr_event.send(
-                MessageChain(
-                    type="tts_stats",
-                    chain=[
-                        Json(
-                            data={
-                                "tts_total_time": tts_duration,
-                                "tts_first_frame_time": tts_first_frame_time,
-                                "tts": tts_provider.meta().type,
-                                "chat_model": agent_runner.provider.get_model(),
-                            }
-                        )
-                    ],
+    astr_event = agent_runner.run_context.context.event
+
+    # Skip tts_stats when the pipeline was aborted (fail_closed hook, or
+    # any other handler that called event.stop_event()). The webchat user
+    # must not receive a trailing message after a fail-closed abort.
+    if not astr_event.is_stopped() and feeder_exc is None:
+        try:
+            if astr_event.get_platform_name() == "webchat":
+                tts_duration = tts_end_time - tts_start_time
+                await astr_event.send(
+                    MessageChain(
+                        type="tts_stats",
+                        chain=[
+                            Json(
+                                data={
+                                    "tts_total_time": tts_duration,
+                                    "tts_first_frame_time": tts_first_frame_time,
+                                    "tts": tts_provider.meta().type,
+                                    "chat_model": agent_runner.provider.get_model(),
+                                }
+                            )
+                        ],
+                    )
                 )
-            )
-    except Exception as e:
-        logger.error(f"发送 TTS 统计信息失败: {e}")
+        except Exception as e:
+            logger.error(f"发送 TTS 统计信息失败: {e}")
+
+    if feeder_exc is not None:
+        # Re-raise so PipelineScheduler.execute's HookAbortError catch (or
+        # the generic exception handler) sees it. Use the original
+        # traceback so audit + debugging are unimpaired.
+        raise feeder_exc
 
 
 async def _run_agent_feeder(

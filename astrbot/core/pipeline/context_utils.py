@@ -202,17 +202,23 @@ async def call_event_hook(
         plugins_name=event.plugins_name,
     )
     for handler in handlers:
-        assert inspect.iscoroutinefunction(handler.handler)
         plugin_name = _resolve_plugin_name(handler)
         logger.debug(
             f"hook({hook_type.name}) -> {plugin_name} - {handler.handler_name}",
         )
 
         timeout = handler.timeout_seconds
+        dispatcher_set_timeout = timeout is not None
         started_at = time.perf_counter()
 
         try:
-            if timeout is not None:
+            # Validation runs inside the try so a plugin that registered a
+            # synchronous handler follows the same audit path as any other
+            # handler exception (preserves fail-open behavior for bad
+            # registrations rather than escaping as an AssertionError).
+            assert inspect.iscoroutinefunction(handler.handler)
+
+            if dispatcher_set_timeout:
                 await asyncio.wait_for(
                     handler.handler(event, *args, **kwargs),
                     timeout=timeout,
@@ -231,31 +237,55 @@ async def call_event_hook(
             # propagate without re-recording. event.stop_event() should
             # have already been set by whoever raised it.
             raise
-        except asyncio.TimeoutError:
-            duration_ms = (time.perf_counter() - started_at) * 1000
-            _record_hook_failure(
-                event,
-                handler,
-                plugin_name,
-                hook_type,
-                kind="timeout",
-                exc=None,
-                duration_ms=duration_ms,
-            )
-            if handler.fail_closed:
-                event.stop_event()
-                raise HookAbortError(
-                    f"hook timeout: {plugin_name}.{handler.handler_name} "
-                    f"exceeded {timeout}s",
-                ) from None
-            logger.warning(
-                "%s plugin=%s hook=%s handler=%s timeout_seconds=%s",
-                _HOOK_TIMEOUT_CODE,
-                plugin_name,
-                hook_type.name,
-                handler.handler_name,
-                timeout,
-            )
+        except asyncio.TimeoutError as timeout_exc:
+            # Only classify as a dispatcher timeout when this call actually
+            # installed one. Otherwise the handler raised TimeoutError on
+            # its own (or used its own asyncio.wait_for), and we should
+            # treat it as a normal handler exception so operators get the
+            # traceback and the right error_code.
+            if dispatcher_set_timeout:
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                _record_hook_failure(
+                    event,
+                    handler,
+                    plugin_name,
+                    hook_type,
+                    kind="timeout",
+                    exc=None,
+                    duration_ms=duration_ms,
+                )
+                if handler.fail_closed:
+                    event.stop_event()
+                    raise HookAbortError(
+                        f"hook timeout: {plugin_name}.{handler.handler_name} "
+                        f"exceeded {timeout}s",
+                    ) from None
+                logger.warning(
+                    "%s plugin=%s hook=%s handler=%s timeout_seconds=%s",
+                    _HOOK_TIMEOUT_CODE,
+                    plugin_name,
+                    hook_type.name,
+                    handler.handler_name,
+                    timeout,
+                )
+            else:
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                _record_hook_failure(
+                    event,
+                    handler,
+                    plugin_name,
+                    hook_type,
+                    kind="exception",
+                    exc=timeout_exc,
+                    duration_ms=duration_ms,
+                )
+                if handler.fail_closed:
+                    event.stop_event()
+                    raise HookAbortError(
+                        f"hook failed: {plugin_name}.{handler.handler_name}: "
+                        f"{type(timeout_exc).__name__}: {timeout_exc}",
+                    ) from timeout_exc
+                logger.error(traceback.format_exc())
         except BaseException as exc:
             duration_ms = (time.perf_counter() - started_at) * 1000
             _record_hook_failure(

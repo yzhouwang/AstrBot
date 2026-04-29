@@ -338,3 +338,145 @@ async def test_cancelled_error_propagates(isolated_registry, fail_closed):
     # CancelledError must not have been recorded as a hook_failure — it is
     # the cooperative-cancellation channel, not an error.
     event.trace.record.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 9. A synchronous handler (registration bug) follows the audit path
+# instead of escaping as an AssertionError. Preserves fail-open default
+# for accidentally-broken plugin registrations.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_handler_does_not_escape_audit(isolated_registry):
+    """A plugin that accidentally registers a synchronous function should
+    follow the same audit path as any other handler exception, not crash
+    the dispatcher with an AssertionError."""
+    from astrbot.core.star.register.star_handler import get_handler_or_create
+
+    def sync_handler(event: Any, req: Any) -> None:  # NOT async!
+        pass
+
+    md = get_handler_or_create(sync_handler, EventType.OnLLMRequestEvent)
+    md.fail_closed = False  # default — should fail open via audit
+
+    second_called = MagicMock()
+
+    @filter_decorators.on_llm_request()
+    async def downstream_runs(event: Any, req: Any) -> None:
+        second_called()
+
+    event = _make_test_event()
+
+    # Should NOT raise — should follow the fail-open audit path.
+    result = await call_event_hook(event, EventType.OnLLMRequestEvent, MagicMock())
+
+    assert result is False
+    second_called.assert_called_once()
+    # The audit recorded the registration bug as an exception kind.
+    event.trace.record.assert_called()
+    assert event.trace.record.call_args.kwargs["kind"] == "exception"
+
+
+# ---------------------------------------------------------------------------
+# 10. Handler-raised TimeoutError when dispatcher did NOT install a
+# timeout is classified as an exception (not a misleading "hook timeout
+# exceeded Nones"). Operators get a real traceback.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handler_timeout_without_dispatcher_timeout(isolated_registry):
+    @filter_decorators.on_llm_request(fail_closed=True)
+    async def handler_self_timeout(event: Any, req: Any) -> None:
+        # Handler raises TimeoutError on its own; dispatcher did not set
+        # timeout_seconds.
+        raise TimeoutError("backend call took too long")
+
+    event = _make_test_event()
+
+    with pytest.raises(HookAbortError) as exc_info:
+        await call_event_hook(event, EventType.OnLLMRequestEvent, MagicMock())
+
+    # Error message classifies as a real exception, not as a fake "exceeded Nones"
+    msg = str(exc_info.value)
+    assert "TimeoutError" in msg or "took too long" in msg
+    assert "Nones" not in msg
+
+    event.trace.record.assert_called()
+    record_kwargs = event.trace.record.call_args.kwargs
+    assert record_kwargs["kind"] == "exception"
+    assert record_kwargs["exception_type"] == "TimeoutError"
+    assert record_kwargs["traceback"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 11. Live-mode HookAbortError surfaces from the feeder task and the
+# trailing tts_stats send is suppressed. Without this fix, a fail_closed
+# hook abort during live streaming would still send the user a message.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_live_agent_propagates_feeder_hook_abort(isolated_registry):
+    """run_live_agent must raise HookAbortError out of its async generator
+    (so PipelineScheduler.execute's catch fires) and must NOT send the
+    webchat tts_stats message after a fail_closed abort."""
+    from astrbot.core.astr_agent_run_util import run_live_agent
+    from astrbot.core.exceptions import HookAbortError as _HookAbortError
+
+    # Build a minimal agent_runner with the bits run_live_agent reaches
+    # for: run_context.context.event, provider.get_model().
+    agent_runner = MagicMock()
+    event = _make_test_event()
+    event.get_platform_name = MagicMock(return_value="webchat")
+    agent_runner.run_context = MagicMock()
+    agent_runner.run_context.context = MagicMock()
+    agent_runner.run_context.context.event = event
+    agent_runner.provider = MagicMock()
+    agent_runner.provider.get_model = MagicMock(return_value="test-model")
+
+    # fake run_agent raises HookAbortError on first iteration (mimics
+    # call_event_hook firing inside the runner with a fail_closed handler).
+    async def fake_run_agent(*args, **kwargs):
+        event.stop_event()
+        raise _HookAbortError("simulated fail_closed abort in feeder")
+        yield  # pragma: no cover — make this an async generator
+
+    # Stand-in TTS task: drain text_queue (which the feeder's finally clause
+    # will None-terminate) and signal audio_queue end-of-stream so the main
+    # loop in run_live_agent exits.
+    async def fake_tts(tts_provider, text_queue, audio_queue):
+        while True:
+            item = await text_queue.get()
+            if item is None:
+                break
+        await audio_queue.put(None)
+
+    tts_provider = MagicMock()
+    tts_provider.support_stream = MagicMock(return_value=True)
+    tts_provider.meta = MagicMock(return_value=MagicMock(type="test_tts"))
+
+    async def _drain():
+        with patch("astrbot.core.astr_agent_run_util.run_agent", fake_run_agent):
+            with patch(
+                "astrbot.core.astr_agent_run_util._safe_tts_stream_wrapper",
+                fake_tts,
+            ):
+                async for _ in run_live_agent(
+                    agent_runner,
+                    tts_provider,
+                    max_step=10,
+                    show_tool_use=False,
+                    show_tool_call_result=False,
+                    show_reasoning=False,
+                    buffer_intermediate_messages=False,
+                ):
+                    pass
+
+    with pytest.raises(_HookAbortError):
+        await _drain()
+
+    # The trailing tts_stats send must NOT have been called — pipeline was
+    # aborted; user must not see a message.
+    event.send.assert_not_called()
