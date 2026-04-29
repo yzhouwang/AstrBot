@@ -597,6 +597,48 @@ async def on_agent_done(self, event: AstrMessageEvent, run_context: ContextWrapp
 
 > 这里不能使用 yield 来发送消息。如需发送，请直接使用 `event.send()` 方法。
 
+##### LLM 钩子的硬化模式：fail_closed 与 timeout_seconds
+
+> 适用于 AstrBot 版本 > v4.23.6
+
+LLM 钩子默认是 **fail-open** 的：钩子抛出异常会被记录，但管道会继续运行。这对于聊天和角色扮演场景是合适的，但对于强制安全策略的钩子（如 PII 脱敏、引用校验、合规审计日志）来说是不可接受的。
+
+所有 6 个 LLM 钩子装饰器（`@on_llm_request`、`@on_llm_response`、`@on_llm_tool_respond`、`@on_using_llm_tool`、`@on_agent_begin`、`@on_agent_done`）都接受两个新的可选关键字参数：
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `fail_closed` | `bool` | `False` | 当 `True` 且钩子抛出异常或超时时，**整个管道会被中止**：`event.stop_event()` 会被调用，不会向用户发送回复，对话历史不会追加这一轮，并抛出 `HookAbortError`。同时记录稳定的错误码 `ASTRBOT_HOOK_FAIL_CLOSED` 用于告警。 |
+| `timeout_seconds` | `float \| None` | `None` | 单次钩子调用的超时秒数（基于 `asyncio.wait_for`）。当 `fail_closed=True` 时超时会触发管道中止；当 `fail_closed=False` 时超时仅记录 `ASTRBOT_HOOK_TIMEOUT` 警告，并继续下一个 handler。 |
+
+`KeyboardInterrupt` 与 `SystemExit` 始终向上传播，与 `fail_closed` 无关。
+
+**示例：PII 脱敏插件 (fail_closed=True)**
+
+```python
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import ProviderRequest
+
+@filter.on_llm_request(fail_closed=True, timeout_seconds=5.0)
+async def redact_pii(self, event: AstrMessageEvent, req: ProviderRequest):
+    # 如果脱敏失败或超过 5 秒，绝不允许原始 PII 进入 LLM 请求。
+    req.system_prompt = await self.redactor.scrub(req.system_prompt)
+    req.prompt = await self.redactor.scrub(req.prompt)
+```
+
+如果 `redactor.scrub` 抛出异常或运行超过 5 秒，请求会被中止；用户不会收到回复，对话历史也不会记录这一轮。审计事件会通过 `event.trace.record("hook_failure", ...)` 写入，包含 `hook_name`、`plugin_name`、`exception_type`、`traceback`、`duration_ms` 等字段，并附带 `metric_name`（默认值 `astrbot.hook.fail_closed`，可通过 `pipeline.hook_failure_metric_name` 配置覆盖）。
+
+**何时使用 `fail_closed=True`：**
+- 钩子在执行硬性策略：脱敏、合规过滤、引用校验、强制审计日志
+- 失败时静默跳过比短暂的服务降级更糟糕
+
+**何时保持默认 (`fail_closed=False`)：**
+- 钩子在做"最大努力"的丰富化：个性提示词增强、可选指标、缓存预热
+- 失败比中止用户请求成本更高
+
+> **关于平台适配器：** `fail_closed=True` 通过 `event.stop_event()` 中断管道。`PipelineScheduler` 与 `InternalAgentSubStage` 都已显式捕获 `HookAbortError` 并抑制后续阶段，因此包括 Lark（本次硬化的审计目标）、aiocqhttp、Telegram 等共享 `RespondStage` 的内置适配器都能正确忽略中止的回复。
+>
+> **流式响应注意：** 如果在 `on_llm_response` 钩子触发前流式输出已经向用户产生了部分字节，那一部分仍可能可见。彻底解决需要重构流式管道（不在本次改动范围）。
+
 ##### 发送消息前
 
 在发送消息前，会触发 `on_decorating_result` 钩子。

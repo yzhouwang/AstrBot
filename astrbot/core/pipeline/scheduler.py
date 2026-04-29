@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator
 
 from astrbot.core import logger
+from astrbot.core.exceptions import HookAbortError
 from astrbot.core.platform import AstrMessageEvent
 from astrbot.core.platform.sources.webchat.webchat_event import WebChatMessageEvent
 from astrbot.core.platform.sources.wecom_ai_bot.wecomai_event import (
@@ -84,7 +85,23 @@ class PipelineScheduler:
         """
         active_event_registry.register(event)
         try:
-            await self._process_stages(event)
+            try:
+                await self._process_stages(event)
+            except HookAbortError as e:
+                # A fail_closed=True LLM hook handler raised or timed out.
+                # call_event_hook already called event.stop_event() and
+                # recorded a structured audit, so subsequent stages will
+                # short-circuit. Catch here as a safety net for stages that
+                # do not handle HookAbortError themselves; specific stages
+                # (e.g. internal agent sub-stage) may catch it earlier to
+                # avoid sending a generic error message to the user.
+                logger.warning(
+                    "Pipeline aborted by fail_closed hook: %s. "
+                    "User-facing reply suppressed.",
+                    e,
+                )
+                if not event.is_stopped():
+                    event.stop_event()
 
             # 发送一个空消息, 以便于后续的处理
             if isinstance(event, WebChatMessageEvent | WecomAIBotMessageEvent):

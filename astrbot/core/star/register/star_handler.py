@@ -414,7 +414,31 @@ def register_on_waiting_llm_request(**kwargs):
     return decorator
 
 
-def register_on_llm_request(**kwargs):
+def _apply_hook_hardening(
+    md: StarHandlerMetadata,
+    *,
+    fail_closed: bool,
+    timeout_seconds: float | None,
+) -> None:
+    """Set the fail-closed / timeout fields on a hook handler's metadata.
+
+    Centralized so the six LLM hook decorators stay in sync. Validates that
+    ``timeout_seconds`` is positive when provided.
+    """
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError(
+            f"timeout_seconds must be > 0 when set; got {timeout_seconds!r}",
+        )
+    md.fail_closed = bool(fail_closed)
+    md.timeout_seconds = timeout_seconds
+
+
+def register_on_llm_request(
+    *,
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当有 LLM 请求时的事件
 
     Examples:
@@ -428,16 +452,30 @@ def register_on_llm_request(**kwargs):
 
     请务必接收两个参数：event, request
 
+    Args:
+        fail_closed: When True, an exception or timeout aborts the pipeline.
+            No user-facing message is sent and the failed turn is not appended
+            to conversation history. Defaults to False (existing behavior).
+        timeout_seconds: Optional per-invocation timeout. None disables.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnLLMRequestEvent, **kwargs)
+        md = get_handler_or_create(awaitable, EventType.OnLLMRequestEvent, **kwargs)
+        _apply_hook_hardening(
+            md, fail_closed=fail_closed, timeout_seconds=timeout_seconds
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_llm_response(**kwargs):
+def register_on_llm_response(
+    *,
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当有 LLM 请求后的事件
 
     Examples:
@@ -451,16 +489,30 @@ def register_on_llm_response(**kwargs):
 
     请务必接收两个参数：event, request
 
+    Args:
+        fail_closed: When True, an exception or timeout aborts the pipeline.
+            No user-facing message is sent and the failed turn is not appended
+            to conversation history. Defaults to False (existing behavior).
+        timeout_seconds: Optional per-invocation timeout. None disables.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnLLMResponseEvent, **kwargs)
+        md = get_handler_or_create(awaitable, EventType.OnLLMResponseEvent, **kwargs)
+        _apply_hook_hardening(
+            md, fail_closed=fail_closed, timeout_seconds=timeout_seconds
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_agent_begin(**kwargs):
+def register_on_agent_begin(
+    *,
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当 Agent 开始运行时的事件
 
     Examples:
@@ -479,16 +531,30 @@ def register_on_agent_begin(**kwargs):
 
     请务必接收两个参数：event, run_context
 
+    Args:
+        fail_closed: When True, an exception or timeout aborts the pipeline.
+            No user-facing message is sent and the failed turn is not appended
+            to conversation history. Defaults to False (existing behavior).
+        timeout_seconds: Optional per-invocation timeout. None disables.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnAgentBeginEvent, **kwargs)
+        md = get_handler_or_create(awaitable, EventType.OnAgentBeginEvent, **kwargs)
+        _apply_hook_hardening(
+            md, fail_closed=fail_closed, timeout_seconds=timeout_seconds
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_agent_done(**kwargs):
+def register_on_agent_done(
+    *,
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当 Agent 运行完成后的事件
 
     Examples:
@@ -509,16 +575,30 @@ def register_on_agent_done(**kwargs):
 
     请务必接收三个参数：event, run_context, response
 
+    Args:
+        fail_closed: When True, an exception or timeout aborts the pipeline.
+            No user-facing message is sent and the failed turn is not appended
+            to conversation history. Defaults to False (existing behavior).
+        timeout_seconds: Optional per-invocation timeout. None disables.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnAgentDoneEvent, **kwargs)
+        md = get_handler_or_create(awaitable, EventType.OnAgentDoneEvent, **kwargs)
+        _apply_hook_hardening(
+            md, fail_closed=fail_closed, timeout_seconds=timeout_seconds
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_using_llm_tool(**kwargs):
+def register_on_using_llm_tool(
+    *,
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当调用函数工具前的事件。
     会传入 tool 和 tool_args 参数。
 
@@ -533,16 +613,30 @@ def register_on_using_llm_tool(**kwargs):
 
     请务必接收三个参数：event, tool, tool_args
 
+    Args:
+        fail_closed: When True, an exception or timeout aborts the pipeline.
+            No user-facing message is sent and the failed turn is not appended
+            to conversation history. Defaults to False (existing behavior).
+        timeout_seconds: Optional per-invocation timeout. None disables.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnUsingLLMToolEvent, **kwargs)
+        md = get_handler_or_create(awaitable, EventType.OnUsingLLMToolEvent, **kwargs)
+        _apply_hook_hardening(
+            md, fail_closed=fail_closed, timeout_seconds=timeout_seconds
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_llm_tool_respond(**kwargs):
+def register_on_llm_tool_respond(
+    *,
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当调用函数工具后的事件。
     会传入 tool、tool_args 和 tool 的调用结果 tool_result 参数。
 
@@ -558,10 +652,19 @@ def register_on_llm_tool_respond(**kwargs):
 
     请务必接收四个参数：event, tool, tool_args, tool_result
 
+    Args:
+        fail_closed: When True, an exception or timeout aborts the pipeline.
+            No user-facing message is sent and the failed turn is not appended
+            to conversation history. Defaults to False (existing behavior).
+        timeout_seconds: Optional per-invocation timeout. None disables.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnLLMToolRespondEvent, **kwargs)
+        md = get_handler_or_create(awaitable, EventType.OnLLMToolRespondEvent, **kwargs)
+        _apply_hook_hardening(
+            md, fail_closed=fail_closed, timeout_seconds=timeout_seconds
+        )
         return awaitable
 
     return decorator

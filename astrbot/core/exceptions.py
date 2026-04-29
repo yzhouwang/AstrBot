@@ -30,3 +30,19 @@ class KnowledgeBaseUploadError(AstrBotError):
 
     def __str__(self) -> str:
         return self.user_message
+
+
+class HookAbortError(AstrBotError):
+    """Raised by ``call_event_hook`` when a handler registered with
+    ``fail_closed=True`` raises or exceeds its ``timeout_seconds``.
+
+    Catchers (the agent sub-stages) must:
+      * skip ``_save_to_history`` so the failed turn does not poison the
+        conversation,
+      * not call ``event.send`` so no partial reply reaches the user,
+      * ensure ``event.stop_event()`` is set so downstream pipeline stages
+        (result decoration, respond stage) bail out via ``is_stopped()``.
+
+    ``call_event_hook`` already calls ``event.stop_event()`` before raising,
+    so callers only need to handle the propagation path.
+    """

@@ -54,6 +54,14 @@ WEBHOOK_SUPPORTED_PLATFORMS = [
 # 默认配置
 DEFAULT_CONFIG = {
     "config_version": 2,
+    "pipeline": {
+        # Stable metric name surfaced in event.trace.record("hook_failure", ...)
+        # so operators can alert on hook fail-closed events in their own
+        # monitoring backend. The audit also emits a stable error_code
+        # (ASTRBOT_HOOK_FAIL_CLOSED / ASTRBOT_HOOK_FAIL_OPEN /
+        # ASTRBOT_HOOK_TIMEOUT) regardless of this value.
+        "hook_failure_metric_name": "astrbot.hook.fail_closed",
+    },
     "platform_settings": {
         "unique_session": False,
         "rate_limit": {

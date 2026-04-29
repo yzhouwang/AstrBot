@@ -274,6 +274,20 @@ class StarHandlerMetadata(Generic[H]):
 
     enabled: bool = True
 
+    fail_closed: bool = False
+    """When True, an exception or timeout in this handler aborts the pipeline:
+    no user-facing message is sent and history is not appended. Defaults to
+    False, preserving the existing fail-open behavior. Currently honored only
+    by the six LLM hook decorators (on_llm_request / on_llm_response /
+    on_llm_tool_respond / on_using_llm_tool / on_agent_begin / on_agent_done).
+    """
+
+    timeout_seconds: float | None = None
+    """Per-invocation timeout in seconds, implemented via ``asyncio.wait_for``.
+    None means no timeout. When ``fail_closed`` is True a timeout aborts the
+    pipeline; otherwise it logs a warning and continues to the next handler.
+    """
+
     def __lt__(self, other: StarHandlerMetadata):
         """定义小于运算符以支持优先队列"""
         return self.extras_configs.get("priority", 0) < other.extras_configs.get(

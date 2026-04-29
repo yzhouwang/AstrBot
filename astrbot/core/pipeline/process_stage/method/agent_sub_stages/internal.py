@@ -18,6 +18,7 @@ from astrbot.core.astr_main_agent import (
     MainAgentBuildResult,
     build_main_agent,
 )
+from astrbot.core.exceptions import HookAbortError
 from astrbot.core.message.components import File, Image, Record, Video
 from astrbot.core.message.message_event_result import (
     MessageChain,
@@ -394,6 +395,20 @@ class InternalAgentSubStage(Stage):
                     if runner_registered and agent_runner is not None:
                         unregister_active_runner(event.unified_msg_origin, agent_runner)
 
+        except HookAbortError as e:
+            # A fail_closed=True LLM hook handler raised or timed out.
+            # call_event_hook already called event.stop_event() and recorded a
+            # structured audit; suppress the user-facing reply and skip the
+            # history append. The is_stopped() guard around _save_to_history
+            # already takes care of the latter when no exception slipped in
+            # mid-streaming, but be explicit defensively.
+            logger.warning(
+                "Pipeline aborted by fail_closed hook: %s. "
+                "Suppressing user reply and skipping history append.",
+                e,
+            )
+            if not event.is_stopped():
+                event.stop_event()
         except Exception as e:
             logger.error(f"Error occurred while processing agent: {e}")
             custom_error_message = extract_persona_custom_error_message_from_event(

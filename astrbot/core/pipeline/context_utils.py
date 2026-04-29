@@ -1,12 +1,19 @@
+import asyncio
 import inspect
+import time
 import traceback
 import typing as T
 
 from astrbot import logger
+from astrbot.core.exceptions import HookAbortError
 from astrbot.core.message.message_event_result import CommandResult, MessageEventResult
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.star.star import star_map
-from astrbot.core.star.star_handler import EventType, star_handlers_registry
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    star_handlers_registry,
+)
 
 
 async def call_handler(
@@ -72,6 +79,97 @@ async def call_handler(
             yield ret
 
 
+_HOOK_FAIL_CLOSED_CODE = "ASTRBOT_HOOK_FAIL_CLOSED"
+_HOOK_FAIL_OPEN_CODE = "ASTRBOT_HOOK_FAIL_OPEN"
+_HOOK_TIMEOUT_CODE = "ASTRBOT_HOOK_TIMEOUT"
+_DEFAULT_HOOK_FAILURE_METRIC = "astrbot.hook.fail_closed"
+
+
+def _resolve_plugin_name(handler: StarHandlerMetadata) -> str:
+    """Resolve the registered plugin name for a handler, falling back to the
+    module path when the plugin record is missing (e.g. in unit tests)."""
+    plugin = star_map.get(handler.handler_module_path)
+    if plugin is not None:
+        return plugin.name
+    return handler.handler_module_path
+
+
+def _resolve_hook_failure_metric_name() -> str:
+    """Read the configured metric name for hook failure audits, with a safe
+    default. Lazy-imported so this module loads cleanly during early
+    bootstrap, before astrbot_config has been initialized."""
+    try:
+        from astrbot.core import astrbot_config
+
+        pipeline_cfg = astrbot_config.get("pipeline", {}) or {}
+        name = pipeline_cfg.get("hook_failure_metric_name")
+        if isinstance(name, str) and name:
+            return name
+    except Exception:
+        pass
+    return _DEFAULT_HOOK_FAILURE_METRIC
+
+
+def _record_hook_failure(
+    event: AstrMessageEvent,
+    handler: StarHandlerMetadata,
+    plugin_name: str,
+    hook_type: EventType,
+    *,
+    kind: str,
+    exc: BaseException | None,
+    duration_ms: float,
+) -> None:
+    """Emit a structured audit event + a stable error code so operators can
+    alert on hook failures without parsing free-form log lines.
+
+    ``kind`` is one of ``"exception"`` or ``"timeout"``. ``exc`` is the
+    underlying error (None for timeouts).
+    """
+    error_code = _HOOK_FAIL_CLOSED_CODE if handler.fail_closed else _HOOK_FAIL_OPEN_CODE
+    if kind == "timeout" and not handler.fail_closed:
+        error_code = _HOOK_TIMEOUT_CODE
+
+    fields: dict[str, T.Any] = {
+        "hook_name": hook_type.name,
+        "handler_name": handler.handler_name,
+        "plugin_name": plugin_name,
+        "kind": kind,
+        "exception_type": type(exc).__name__ if exc is not None else None,
+        "traceback": (
+            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            if exc is not None
+            else None
+        ),
+        "duration_ms": duration_ms,
+        "fail_closed": handler.fail_closed,
+        "timeout_seconds": handler.timeout_seconds,
+        "error_code": error_code,
+        "metric_name": _resolve_hook_failure_metric_name(),
+    }
+
+    trace = getattr(event, "trace", None)
+    if trace is not None:
+        try:
+            trace.record("hook_failure", **fields)
+        except Exception:
+            # Audit failure must never mask the real failure.
+            logger.debug(
+                "event.trace.record failed while recording hook_failure",
+                exc_info=True,
+            )
+
+    logger.error(
+        "%s plugin=%s hook=%s handler=%s kind=%s duration_ms=%.1f",
+        error_code,
+        plugin_name,
+        hook_type.name,
+        handler.handler_name,
+        kind,
+        duration_ms,
+    )
+
+
 async def call_event_hook(
     event: AstrMessageEvent,
     hook_type: EventType,
@@ -80,28 +178,99 @@ async def call_event_hook(
 ) -> bool:
     """调用事件钩子函数
 
-    Returns:
-        bool: 如果事件被终止，返回 True
-    #
+    Each handler runs in its own try/except. By default a handler exception
+    is logged and the next handler runs (fail-open, the historical behavior).
+    Handlers registered with ``fail_closed=True`` instead abort the pipeline:
+    ``event.stop_event()`` is called and a :class:`HookAbortError` is raised
+    so the agent sub-stage can suppress the user-facing reply and skip the
+    history append.
 
+    Handlers registered with ``timeout_seconds=N`` run inside
+    ``asyncio.wait_for``. A timeout in a fail-open handler logs a warning
+    and continues; in a fail-closed handler it aborts the pipeline.
+
+    ``KeyboardInterrupt`` and ``SystemExit`` always propagate.
+
+    Returns:
+        bool: True if the event was stopped (either via ``event.stop_event()``
+        from a handler or because a handler aborted the pipeline). On
+        ``fail_closed`` handler failure this function raises
+        :class:`HookAbortError` instead of returning.
     """
     handlers = star_handlers_registry.get_handlers_by_event_type(
         hook_type,
         plugins_name=event.plugins_name,
     )
     for handler in handlers:
+        assert inspect.iscoroutinefunction(handler.handler)
+        plugin_name = _resolve_plugin_name(handler)
+        logger.debug(
+            f"hook({hook_type.name}) -> {plugin_name} - {handler.handler_name}",
+        )
+
+        timeout = handler.timeout_seconds
+        started_at = time.perf_counter()
+
         try:
-            assert inspect.iscoroutinefunction(handler.handler)
-            logger.debug(
-                f"hook({hook_type.name}) -> {star_map[handler.handler_module_path].name} - {handler.handler_name}",
+            if timeout is not None:
+                await asyncio.wait_for(
+                    handler.handler(event, *args, **kwargs),
+                    timeout=timeout,
+                )
+            else:
+                await handler.handler(event, *args, **kwargs)
+        except (KeyboardInterrupt, SystemExit):
+            # Always propagate — interpreter-exit signals must not be
+            # swallowed even when fail_closed is False.
+            raise
+        except asyncio.TimeoutError:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            _record_hook_failure(
+                event,
+                handler,
+                plugin_name,
+                hook_type,
+                kind="timeout",
+                exc=None,
+                duration_ms=duration_ms,
             )
-            await handler.handler(event, *args, **kwargs)
-        except BaseException:
+            if handler.fail_closed:
+                event.stop_event()
+                raise HookAbortError(
+                    f"hook timeout: {plugin_name}.{handler.handler_name} "
+                    f"exceeded {timeout}s",
+                ) from None
+            logger.warning(
+                "%s plugin=%s hook=%s handler=%s timeout_seconds=%s",
+                _HOOK_TIMEOUT_CODE,
+                plugin_name,
+                hook_type.name,
+                handler.handler_name,
+                timeout,
+            )
+        except BaseException as exc:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            _record_hook_failure(
+                event,
+                handler,
+                plugin_name,
+                hook_type,
+                kind="exception",
+                exc=exc,
+                duration_ms=duration_ms,
+            )
+            if handler.fail_closed:
+                event.stop_event()
+                raise HookAbortError(
+                    f"hook failed: {plugin_name}.{handler.handler_name}: "
+                    f"{type(exc).__name__}: {exc}",
+                ) from exc
+            # fail_open + exception: preserve the historical log-and-continue.
             logger.error(traceback.format_exc())
 
         if event.is_stopped():
             logger.info(
-                f"{star_map[handler.handler_module_path].name} - {handler.handler_name} 终止了事件传播。",
+                f"{plugin_name} - {handler.handler_name} 终止了事件传播。",
             )
             return True
 
