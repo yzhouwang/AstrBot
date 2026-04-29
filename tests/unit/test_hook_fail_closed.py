@@ -411,6 +411,50 @@ async def test_handler_timeout_without_dispatcher_timeout(isolated_registry):
 
 
 # ---------------------------------------------------------------------------
+# 10b. Handler-raised TimeoutError EVEN WHEN the dispatcher also installed a
+# timeout must still be classified as a regular exception (not as a
+# dispatcher timeout). Catches the round-3 finding: in Python 3.11+
+# asyncio.TimeoutError IS TimeoutError, so a naked `except` cannot tell
+# them apart unless the handler call is wrapped.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handler_timeout_with_dispatcher_timeout(isolated_registry):
+    """Handler raises TimeoutError() before the dispatcher's timeout
+    elapses. Must record kind="exception" with the handler's traceback,
+    not kind="timeout"."""
+
+    @filter_decorators.on_llm_request(fail_closed=True, timeout_seconds=10.0)
+    async def handler_quick_timeout(event: Any, req: Any) -> None:
+        # Returns immediately with TimeoutError, well before the 10s
+        # dispatcher deadline.
+        raise TimeoutError("backend timed out at 0ms")
+
+    event = _make_test_event()
+
+    with pytest.raises(HookAbortError) as exc_info:
+        await call_event_hook(event, EventType.OnLLMRequestEvent, MagicMock())
+
+    # Must NOT classify as a dispatcher timeout.
+    msg = str(exc_info.value)
+    assert "exceeded" not in msg, (
+        f"got fake dispatcher-timeout message: {msg!r} — handler-raised "
+        "TimeoutError was conflated with wait_for's timeout"
+    )
+    assert "TimeoutError" in msg or "backend timed out" in msg
+
+    event.trace.record.assert_called()
+    record_kwargs = event.trace.record.call_args.kwargs
+    assert record_kwargs["kind"] == "exception", (
+        f"expected kind=exception, got {record_kwargs['kind']!r}"
+    )
+    assert record_kwargs["exception_type"] == "TimeoutError"
+    assert record_kwargs["traceback"] is not None
+    assert record_kwargs["error_code"] == "ASTRBOT_HOOK_FAIL_CLOSED"
+
+
+# ---------------------------------------------------------------------------
 # 11. Live-mode HookAbortError surfaces from the feeder task and the
 # trailing tts_stats send is suppressed. Without this fix, a fail_closed
 # hook abort during live streaming would still send the user a message.

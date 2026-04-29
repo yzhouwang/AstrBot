@@ -85,6 +85,16 @@ _HOOK_TIMEOUT_CODE = "ASTRBOT_HOOK_TIMEOUT"
 _DEFAULT_HOOK_FAILURE_METRIC = "astrbot.hook.fail_closed"
 
 
+class _HandlerRaisedException(Exception):
+    """Internal marker. Wraps any exception raised by the handler body when
+    the dispatcher installed a timeout, so the outer dispatcher can
+    distinguish a wait_for-induced ``asyncio.TimeoutError`` from a
+    ``TimeoutError`` raised by the handler itself (in Python 3.11+ those
+    are the same class). The original exception is in ``__cause__``."""
+
+    pass
+
+
 def _resolve_plugin_name(handler: StarHandlerMetadata) -> str:
     """Resolve the registered plugin name for a handler, falling back to the
     module path when the plugin record is missing (e.g. in unit tests)."""
@@ -219,10 +229,28 @@ async def call_event_hook(
             assert inspect.iscoroutinefunction(handler.handler)
 
             if dispatcher_set_timeout:
-                await asyncio.wait_for(
-                    handler.handler(event, *args, **kwargs),
-                    timeout=timeout,
-                )
+                # Wrap the handler so we can distinguish a wait_for-induced
+                # asyncio.TimeoutError (the dispatcher timing the handler
+                # out) from a TimeoutError the handler itself raised.
+                # In Python 3.11+ asyncio.TimeoutError == TimeoutError, so
+                # a naked except cannot tell them apart. Wrapping handler
+                # exceptions in _HandlerRaisedException makes the
+                # outer except asyncio.TimeoutError unambiguous: only
+                # wait_for's own timeout reaches it.
+                async def _wrap_for_timeout():
+                    try:
+                        await handler.handler(event, *args, **kwargs)
+                    except (
+                        KeyboardInterrupt,
+                        SystemExit,
+                        asyncio.CancelledError,
+                        HookAbortError,
+                    ):
+                        raise
+                    except BaseException as inner_exc:
+                        raise _HandlerRaisedException() from inner_exc
+
+                await asyncio.wait_for(_wrap_for_timeout(), timeout=timeout)
             else:
                 await handler.handler(event, *args, **kwargs)
         except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
@@ -238,13 +266,17 @@ async def call_event_hook(
             # have already been set by whoever raised it.
             raise
         except asyncio.TimeoutError as timeout_exc:
-            # Only classify as a dispatcher timeout when this call actually
-            # installed one. Otherwise the handler raised TimeoutError on
-            # its own (or used its own asyncio.wait_for), and we should
-            # treat it as a normal handler exception so operators get the
-            # traceback and the right error_code.
+            # In Python 3.11+, asyncio.TimeoutError IS TimeoutError. This
+            # branch fires for either:
+            #   (a) wait_for's own timeout — only possible when
+            #       dispatcher_set_timeout is True; handler-raised
+            #       TimeoutErrors in that branch are wrapped in
+            #       _HandlerRaisedException above.
+            #   (b) a handler raising TimeoutError on its own when the
+            #       dispatcher did NOT install a timeout — then we must
+            #       treat it as a regular exception.
+            duration_ms = (time.perf_counter() - started_at) * 1000
             if dispatcher_set_timeout:
-                duration_ms = (time.perf_counter() - started_at) * 1000
                 _record_hook_failure(
                     event,
                     handler,
@@ -269,7 +301,6 @@ async def call_event_hook(
                     timeout,
                 )
             else:
-                duration_ms = (time.perf_counter() - started_at) * 1000
                 _record_hook_failure(
                     event,
                     handler,
@@ -286,6 +317,35 @@ async def call_event_hook(
                         f"{type(timeout_exc).__name__}: {timeout_exc}",
                     ) from timeout_exc
                 logger.error(traceback.format_exc())
+        except _HandlerRaisedException as wrapped:
+            # Handler raised an exception while a dispatcher timeout was
+            # configured. Unwrap and route through the regular exception
+            # path so operators get the real exception_type and traceback,
+            # not a misleading "timeout exceeded {timeout}s".
+            inner = wrapped.__cause__
+            if inner is None:  # defensive; should not happen
+                inner = wrapped
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            _record_hook_failure(
+                event,
+                handler,
+                plugin_name,
+                hook_type,
+                kind="exception",
+                exc=inner,
+                duration_ms=duration_ms,
+            )
+            if handler.fail_closed:
+                event.stop_event()
+                raise HookAbortError(
+                    f"hook failed: {plugin_name}.{handler.handler_name}: "
+                    f"{type(inner).__name__}: {inner}",
+                ) from inner
+            logger.error(
+                "".join(
+                    traceback.format_exception(type(inner), inner, inner.__traceback__)
+                )
+            )
         except BaseException as exc:
             duration_ms = (time.perf_counter() - started_at) * 1000
             _record_hook_failure(
