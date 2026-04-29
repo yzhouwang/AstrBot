@@ -219,9 +219,17 @@ async def call_event_hook(
                 )
             else:
                 await handler.handler(event, *args, **kwargs)
-        except (KeyboardInterrupt, SystemExit):
-            # Always propagate — interpreter-exit signals must not be
-            # swallowed even when fail_closed is False.
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            # Always propagate. KeyboardInterrupt/SystemExit are interpreter
+            # exit signals; CancelledError is asyncio's cooperative
+            # cancellation channel and swallowing it breaks request-scoped
+            # task cancellation and shutdown.
+            raise
+        except HookAbortError:
+            # If a handler itself raised HookAbortError (e.g., a wrapper
+            # plugin proxying another hook), respect the intent and
+            # propagate without re-recording. event.stop_event() should
+            # have already been set by whoever raised it.
             raise
         except asyncio.TimeoutError:
             duration_ms = (time.perf_counter() - started_at) * 1000

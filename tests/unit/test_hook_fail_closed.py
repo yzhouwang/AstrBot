@@ -271,3 +271,70 @@ async def test_keyboard_interrupt_propagates(isolated_registry, fail_closed):
     # KeyboardInterrupt must not have been recoded as a "hook_failure" — the
     # interpreter-exit path must NOT pass through audit logging.
     event.trace.record.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 7. HookAbortError escapes broad `except Exception` catches (regression for
+# the runner-style try/except around agent_hooks.* in
+# tool_loop_agent_runner.py — those catches must NOT swallow the abort).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hook_abort_escapes_exception_catch(isolated_registry):
+    @filter_decorators.on_agent_begin(fail_closed=True)
+    async def aborting_hook(event: Any, run_context: Any) -> None:
+        raise ValueError("policy violation")
+
+    event = _make_test_event()
+
+    swallowed = False
+    aborted = False
+    try:
+        try:
+            await call_event_hook(
+                event, EventType.OnAgentBeginEvent, MagicMock()
+            )
+        except Exception:  # noqa: BLE001 — mimics runner's broad catch
+            swallowed = True
+    except HookAbortError:
+        aborted = True
+
+    assert swallowed is False, (
+        "HookAbortError was caught by `except Exception` — the runner's "
+        "agent_hooks try/except blocks would silently swallow the abort. "
+        "HookAbortError must subclass BaseException, not Exception."
+    )
+    assert aborted is True
+    assert event.is_stopped() is True
+
+
+# ---------------------------------------------------------------------------
+# 8. asyncio.CancelledError propagates cooperatively (regardless of
+# fail_closed). Without this, request-task cancellation during shutdown or
+# user abort would be miscounted as a hook failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_closed", [True, False])
+async def test_cancelled_error_propagates(isolated_registry, fail_closed):
+    if fail_closed:
+
+        @filter_decorators.on_llm_request(fail_closed=True)
+        async def cancelled_handler(event: Any, req: Any) -> None:
+            raise asyncio.CancelledError()
+    else:
+
+        @filter_decorators.on_llm_request()
+        async def cancelled_handler(event: Any, req: Any) -> None:
+            raise asyncio.CancelledError()
+
+    event = _make_test_event()
+
+    with pytest.raises(asyncio.CancelledError):
+        await call_event_hook(event, EventType.OnLLMRequestEvent, MagicMock())
+
+    # CancelledError must not have been recorded as a hook_failure — it is
+    # the cooperative-cancellation channel, not an error.
+    event.trace.record.assert_not_called()

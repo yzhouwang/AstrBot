@@ -32,11 +32,18 @@ class KnowledgeBaseUploadError(AstrBotError):
         return self.user_message
 
 
-class HookAbortError(AstrBotError):
+class HookAbortError(BaseException):
     """Raised by ``call_event_hook`` when a handler registered with
     ``fail_closed=True`` raises or exceeds its ``timeout_seconds``.
 
-    Catchers (the agent sub-stages) must:
+    Subclasses :class:`BaseException` rather than :class:`Exception` (or
+    :class:`AstrBotError`) so the abort propagates past existing broad
+    ``except Exception`` blocks — notably the per-hook catches in
+    ``ToolLoopAgentRunner`` around ``agent_hooks.on_*``. Designed catchers
+    (``PipelineScheduler.execute`` and ``InternalAgentSubStage.process``)
+    match it by type, not by parent class, so they still see it.
+
+    Catchers must:
       * skip ``_save_to_history`` so the failed turn does not poison the
         conversation,
       * not call ``event.send`` so no partial reply reaches the user,
