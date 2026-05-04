@@ -151,17 +151,33 @@ class LarkWebhookServer:
             return {"error": "Empty request body"}, 400
 
         # 如果配置了 encrypt_key，进行签名验证
+        # When encrypt_key is configured, ALL three signature headers are
+        # mandatory. The previous behavior only verified when headers were
+        # present; an attacker could bypass verification by simply omitting
+        # the X-Lark-Signature header. This change makes signature checks
+        # required-when-encrypt-key-is-set (still opt-in via encrypt_key).
+        # See: https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/
+        #      event-subscription-guide/event-subscription-configure-/
+        #      configure-encrypt-key
         if self.encrypt_key:
             timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
             nonce = request.headers.get("X-Lark-Request-Nonce", "")
             signature = request.headers.get("X-Lark-Signature", "")
 
-            if timestamp and nonce and signature:
-                if not self.verify_signature(
-                    timestamp, nonce, self.encrypt_key, body, signature
-                ):
-                    logger.error("[Lark Webhook] 签名验证失败")
-                    return {"error": "Invalid signature"}, 401
+            if not (timestamp and nonce and signature):
+                logger.error(
+                    "[Lark Webhook] 缺少签名头部 / Missing required signature "
+                    "headers (X-Lark-Request-Timestamp, X-Lark-Request-Nonce, "
+                    "X-Lark-Signature). Encrypt key is configured, so all "
+                    "three are mandatory."
+                )
+                return {"error": "Missing signature headers"}, 401
+
+            if not self.verify_signature(
+                timestamp, nonce, self.encrypt_key, body, signature
+            ):
+                logger.error("[Lark Webhook] 签名验证失败")
+                return {"error": "Invalid signature"}, 401
 
         # 检查是否是加密事件
         if "encrypt" in event_data:
