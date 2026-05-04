@@ -8,6 +8,7 @@ from astrbot.core import logger
 from astrbot.core.agent.message import Message
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.exceptions import HookAbortError
 from astrbot.core.message.components import BaseMessageComponent, Json, Plain
 from astrbot.core.message.message_event_result import (
     MessageChain,
@@ -300,6 +301,36 @@ async def run_agent(
 
                 break
 
+        except HookAbortError as e:
+            # A fail_closed governance hook aborted the agent. We must NOT
+            # echo the error to the user (it leaks internal hook names /
+            # plugin paths / failure reasons), and we MUST NOT re-fire
+            # on_agent_done with a synthesised error response — that would
+            # cascade through the same hook chain that just aborted.
+            #
+            # Send the persona's custom_error_message (if any) as a polite
+            # refusal placeholder; otherwise stay silent.
+            if "stop_watcher" in locals() and not stop_watcher.done():
+                stop_watcher.cancel()
+                try:
+                    await stop_watcher
+                except asyncio.CancelledError:
+                    pass
+            logger.error(
+                "AI execution aborted by fail_closed hook %s -> %s.%s: %s",
+                e.hook_name,
+                e.plugin_name,
+                e.handler_name,
+                e.reason,
+            )
+            placeholder = extract_persona_custom_error_message_from_event(astr_event)
+            if placeholder:
+                if agent_runner.streaming:
+                    yield MessageChain().message(placeholder)
+                else:
+                    astr_event.set_result(MessageEventResult().message(placeholder))
+            astr_event.stop_event()
+            return
         except Exception as e:
             if "stop_watcher" in locals() and not stop_watcher.done():
                 stop_watcher.cancel()

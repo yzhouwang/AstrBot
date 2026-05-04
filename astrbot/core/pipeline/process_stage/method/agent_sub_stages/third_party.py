@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from astrbot.core import astrbot_config, logger
+from astrbot.core.exceptions import HookAbortError
 from astrbot.core.agent.runners.coze.coze_agent_runner import CozeAgentRunner
 from astrbot.core.agent.runners.dashscope.dashscope_agent_runner import (
     DashscopeAgentRunner,
@@ -79,6 +80,19 @@ async def run_third_party_agent(
                     yield resp.data["chain"], False
             elif resp.type == "err":
                 yield resp.data["chain"], True
+    except HookAbortError as e:
+        # fail_closed hook aborted — silent refusal (or persona placeholder
+        # via custom_error_message). Don't leak hook names / reasons.
+        logger.error(
+            "Third-party agent aborted by fail_closed hook %s -> %s.%s: %s",
+            e.hook_name,
+            e.plugin_name,
+            e.handler_name,
+            e.reason,
+        )
+        if custom_error_message:
+            yield MessageChain().message(custom_error_message), True
+        return
     except Exception as e:
         logger.error(f"Third party agent runner error: {e}")
         err_msg = custom_error_message
