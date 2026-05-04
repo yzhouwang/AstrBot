@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator
 
 from astrbot.core import logger
+from astrbot.core.exceptions import HookAbortError
 from astrbot.core.platform import AstrMessageEvent
 from astrbot.core.platform.sources.webchat.webchat_event import WebChatMessageEvent
 from astrbot.core.platform.sources.wecom_ai_bot.wecomai_event import (
@@ -84,7 +85,24 @@ class PipelineScheduler:
         """
         active_event_registry.register(event)
         try:
-            await self._process_stages(event)
+            try:
+                await self._process_stages(event)
+            except HookAbortError as exc:
+                # A fail_closed governance hook aborted the pipeline. The
+                # dispatch site has already called event.stop_event() and
+                # logged the failure; suppress any further user-facing send
+                # and skip the trailing empty-message ping for webchat /
+                # wecom AI bot to ensure no partial reply leaks out.
+                logger.error(
+                    "Pipeline aborted by fail_closed hook %s -> %s.%s: %s",
+                    exc.hook_name,
+                    exc.plugin_name,
+                    exc.handler_name,
+                    exc.reason,
+                )
+                event.stop_event()
+                event.clear_result()
+                return
 
             # 发送一个空消息, 以便于后续的处理
             if isinstance(event, WebChatMessageEvent | WecomAIBotMessageEvent):

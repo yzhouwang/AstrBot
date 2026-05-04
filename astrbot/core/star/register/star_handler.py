@@ -50,6 +50,16 @@ def get_handler_or_create(
     md = star_handlers_registry.get_handler_by_full_name(handler_full_name)
     if md:
         return md
+    # Pop the structured fields off kwargs before they land in extras_configs.
+    fail_closed = bool(kwargs.pop("fail_closed", False))
+    timeout_seconds = kwargs.pop("timeout_seconds", None)
+    if timeout_seconds is not None:
+        timeout_seconds = float(timeout_seconds)
+        if timeout_seconds <= 0:
+            raise ValueError(
+                "timeout_seconds must be positive when set on a hook decorator."
+            )
+
     md = StarHandlerMetadata(
         event_type=event_type,
         handler_full_name=handler_full_name,
@@ -57,6 +67,8 @@ def get_handler_or_create(
         handler_module_path=handler.__module__,
         handler=handler,
         event_filters=[],
+        fail_closed=fail_closed,
+        timeout_seconds=timeout_seconds,
     )
 
     # 插件handler的附加额外信息
@@ -414,7 +426,11 @@ def register_on_waiting_llm_request(**kwargs):
     return decorator
 
 
-def register_on_llm_request(**kwargs):
+def register_on_llm_request(
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当有 LLM 请求时的事件
 
     Examples:
@@ -428,16 +444,34 @@ def register_on_llm_request(**kwargs):
 
     请务必接收两个参数：event, request
 
+    Args:
+        fail_closed: When ``True``, an unhandled exception or timeout in this
+            handler raises :class:`HookAbortError` and aborts the pipeline.
+            Defaults to ``False`` (legacy behavior — log and continue).
+        timeout_seconds: Optional per-handler wall-clock budget enforced via
+            ``asyncio.wait_for``. Combined with ``fail_closed=True`` the
+            timeout aborts the pipeline; otherwise it is logged.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnLLMRequestEvent, **kwargs)
+        _ = get_handler_or_create(
+            awaitable,
+            EventType.OnLLMRequestEvent,
+            fail_closed=fail_closed,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_llm_response(**kwargs):
+def register_on_llm_response(
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当有 LLM 请求后的事件
 
     Examples:
@@ -451,16 +485,32 @@ def register_on_llm_response(**kwargs):
 
     请务必接收两个参数：event, request
 
+    Args:
+        fail_closed: See :func:`register_on_llm_request`. Particularly relevant
+            for response validators (PII redaction, citation faithfulness,
+            policy filters) where silent skip on failure is unacceptable.
+        timeout_seconds: Optional per-handler wall-clock budget.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnLLMResponseEvent, **kwargs)
+        _ = get_handler_or_create(
+            awaitable,
+            EventType.OnLLMResponseEvent,
+            fail_closed=fail_closed,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_agent_begin(**kwargs):
+def register_on_agent_begin(
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当 Agent 开始运行时的事件
 
     Examples:
@@ -479,16 +529,30 @@ def register_on_agent_begin(**kwargs):
 
     请务必接收两个参数：event, run_context
 
+    Args:
+        fail_closed: See :func:`register_on_llm_request`.
+        timeout_seconds: Optional per-handler wall-clock budget.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnAgentBeginEvent, **kwargs)
+        _ = get_handler_or_create(
+            awaitable,
+            EventType.OnAgentBeginEvent,
+            fail_closed=fail_closed,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_agent_done(**kwargs):
+def register_on_agent_done(
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当 Agent 运行完成后的事件
 
     Examples:
@@ -509,16 +573,30 @@ def register_on_agent_done(**kwargs):
 
     请务必接收三个参数：event, run_context, response
 
+    Args:
+        fail_closed: See :func:`register_on_llm_request`.
+        timeout_seconds: Optional per-handler wall-clock budget.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnAgentDoneEvent, **kwargs)
+        _ = get_handler_or_create(
+            awaitable,
+            EventType.OnAgentDoneEvent,
+            fail_closed=fail_closed,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_using_llm_tool(**kwargs):
+def register_on_using_llm_tool(
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当调用函数工具前的事件。
     会传入 tool 和 tool_args 参数。
 
@@ -533,16 +611,30 @@ def register_on_using_llm_tool(**kwargs):
 
     请务必接收三个参数：event, tool, tool_args
 
+    Args:
+        fail_closed: See :func:`register_on_llm_request`.
+        timeout_seconds: Optional per-handler wall-clock budget.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnUsingLLMToolEvent, **kwargs)
+        _ = get_handler_or_create(
+            awaitable,
+            EventType.OnUsingLLMToolEvent,
+            fail_closed=fail_closed,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
         return awaitable
 
     return decorator
 
 
-def register_on_llm_tool_respond(**kwargs):
+def register_on_llm_tool_respond(
+    fail_closed: bool = False,
+    timeout_seconds: float | None = None,
+    **kwargs,
+):
     """当调用函数工具后的事件。
     会传入 tool、tool_args 和 tool 的调用结果 tool_result 参数。
 
@@ -558,10 +650,20 @@ def register_on_llm_tool_respond(**kwargs):
 
     请务必接收四个参数：event, tool, tool_args, tool_result
 
+    Args:
+        fail_closed: See :func:`register_on_llm_request`.
+        timeout_seconds: Optional per-handler wall-clock budget.
+
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(awaitable, EventType.OnLLMToolRespondEvent, **kwargs)
+        _ = get_handler_or_create(
+            awaitable,
+            EventType.OnLLMToolRespondEvent,
+            fail_closed=fail_closed,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
         return awaitable
 
     return decorator

@@ -18,6 +18,7 @@ from astrbot.core.astr_main_agent import (
     MainAgentBuildResult,
     build_main_agent,
 )
+from astrbot.core.exceptions import HookAbortError
 from astrbot.core.message.components import File, Image, Record, Video
 from astrbot.core.message.message_event_result import (
     MessageChain,
@@ -394,6 +395,18 @@ class InternalAgentSubStage(Stage):
                     if runner_registered and agent_runner is not None:
                         unregister_active_runner(event.unified_msg_origin, agent_runner)
 
+        except HookAbortError as e:
+            # A fail_closed governance hook aborted the pipeline. We must NOT
+            # send anything to the user; the hook owner is responsible for any
+            # operator-facing alerting via its audit log.
+            logger.error(
+                "Pipeline aborted by fail_closed hook %s -> %s.%s: %s",
+                e.hook_name,
+                e.plugin_name,
+                e.handler_name,
+                e.reason,
+            )
+            event.stop_event()
         except Exception as e:
             logger.error(f"Error occurred while processing agent: {e}")
             custom_error_message = extract_persona_custom_error_message_from_event(

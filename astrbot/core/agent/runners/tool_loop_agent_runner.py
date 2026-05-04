@@ -29,7 +29,7 @@ from astrbot import logger
 from astrbot.core.agent.message import ImageURLPart, TextPart, ThinkPart
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.agent.tool_image_cache import tool_image_cache
-from astrbot.core.exceptions import EmptyModelOutputError
+from astrbot.core.exceptions import EmptyModelOutputError, HookAbortError
 from astrbot.core.message.components import Json
 from astrbot.core.message.message_event_result import (
     MessageChain,
@@ -198,6 +198,10 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
         try:
             await self.agent_hooks.on_agent_done(self.run_context, llm_resp)
+        except HookAbortError:
+            # Propagate fail_closed aborts so the caller can suppress sending.
+            self._resolve_unconsumed_follow_ups()
+            raise
         except Exception as e:
             logger.error(f"Error in on_agent_done hook: {e}", exc_info=True)
         self._resolve_unconsumed_follow_ups()
@@ -697,6 +701,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         if self._state == AgentState.IDLE:
             try:
                 await self.agent_hooks.on_agent_begin(self.run_context)
+            except HookAbortError:
+                # Propagate fail_closed aborts so the caller can suppress sending.
+                raise
             except Exception as e:
                 logger.error(f"Error in on_agent_begin hook: {e}", exc_info=True)
 
@@ -1066,6 +1073,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         func_tool,
                         valid_params,
                     )
+                except HookAbortError:
+                    # Propagate fail_closed aborts so the caller can suppress sending.
+                    raise
                 except Exception as e:
                     logger.error(f"Error in on_tool_start hook: {e}", exc_info=True)
 
@@ -1189,10 +1199,16 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         func_tool_args,
                         _final_resp,
                     )
+                except HookAbortError:
+                    # Propagate fail_closed aborts so the caller can suppress sending.
+                    raise
                 except Exception as e:
                     logger.error(f"Error in on_tool_end hook: {e}", exc_info=True)
             except Exception as e:
-                if isinstance(e, _ToolExecutionInterrupted):
+                if isinstance(e, (_ToolExecutionInterrupted, HookAbortError)):
+                    # _ToolExecutionInterrupted: stop request, propagate.
+                    # HookAbortError: fail_closed hook aborted the pipeline,
+                    #   surface to caller without converting to a tool result.
                     raise
                 logger.warning(traceback.format_exc())
                 _append_tool_call_result(
@@ -1375,6 +1391,11 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
         try:
             await self.agent_hooks.on_agent_done(self.run_context, llm_resp)
+        except HookAbortError:
+            # The user already requested an abort; if a fail_closed hook also
+            # raises here we still suppress the user-facing reply, so propagate.
+            self._resolve_unconsumed_follow_ups()
+            raise
         except Exception as e:
             logger.error(f"Error in on_agent_done hook: {e}", exc_info=True)
 

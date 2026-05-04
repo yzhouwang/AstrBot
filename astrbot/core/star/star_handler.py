@@ -274,6 +274,25 @@ class StarHandlerMetadata(Generic[H]):
 
     enabled: bool = True
 
+    fail_closed: bool = False
+    """If True, an exception or timeout in this handler aborts the pipeline
+    via :class:`astrbot.core.exceptions.HookAbortError`.
+
+    Default ``False`` preserves the legacy log-and-continue behaviour. Currently
+    consumed by :func:`astrbot.core.pipeline.context_utils.call_event_hook`
+    for the LLM-related hooks (``OnLLMRequestEvent``, ``OnLLMResponseEvent``,
+    ``OnAgentBeginEvent``, ``OnAgentDoneEvent``, ``OnUsingLLMToolEvent``,
+    ``OnLLMToolRespondEvent``).
+    """
+
+    timeout_seconds: float | None = None
+    """Optional per-handler wall-clock budget enforced via ``asyncio.wait_for``.
+
+    ``None`` disables the timeout. Combined with :attr:`fail_closed`, a timeout
+    raises :class:`HookAbortError`; otherwise the timeout is logged and the
+    pipeline continues.
+    """
+
     def __lt__(self, other: StarHandlerMetadata):
         """定义小于运算符以支持优先队列"""
         return self.extras_configs.get("priority", 0) < other.extras_configs.get(
